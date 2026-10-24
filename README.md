@@ -35,6 +35,14 @@ tts -f script.txt -v "af_heart:70,af_bella:30" -s 1.1 -o blend.wav
 tts --list-voices
 ```
 
+Or skip the file and stream the audio as it's generated, sentence by sentence:
+
+```bash
+tts --stream play "Straight to the speakers."                  # play | wav | raw
+tts --stream wav -f script.txt | ffplay -nodisp -autoexit -    # WAV on stdout for piping
+some-llm-command | tts --stream play -f -                      # speaks while the text is still arriving
+```
+
 Each line of the script becomes one segment (`--split paragraph` or `--split sentence` to change that), joined by a 0.35 s pause (`--pause`). The JSON looks like:
 
 ```json
@@ -51,7 +59,7 @@ ffmpeg -i video.mp4 -i narration.mp3 -map 0:v -map 1:a -c:v copy -c:a aac -short
 
 More in the docs:
 
-- [docs/usage.md](docs/usage.md): every option, the timing format, video recipes, pronunciation tips, streaming
+- [docs/usage.md](docs/usage.md): every option, the timing format, video recipes, pronunciation tips, streaming (`--stream`)
 - [docs/voices.md](docs/voices.md): voices by language, with quality grades
 - [docs/troubleshooting.md](docs/troubleshooting.md): common errors and fixes
 

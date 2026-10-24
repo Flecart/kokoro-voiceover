@@ -12,6 +12,12 @@ espeak-ng (used for pronunciation) can't read its data directory when the path i
 **`checksum mismatch` during install**
 The model download was interrupted or altered. Re-run the installer; it retries and only keeps files whose sha256 matches.
 
+**`--stream play`: `no audio player found` or `audio player … exited with code 1`**
+`play` needs `paplay` (package `pulseaudio-utils`), `aplay` (`alsa-utils`) or `ffplay` (`ffmpeg`), and a working sound device. Ubuntu desktops have `paplay` already. Check the device with `speaker-test -t sine -l 1`. To use another player, set `TTS_PLAYER` to a command that reads WAV from stdin, or pipe: `tts --stream wav … | your-player`.
+
+**`--stream wav writes binary audio to stdout`**
+`wav` and `raw` print audio data, so `tts` refuses to dump it into a terminal. Pipe it into a player or another program, or use `--stream play`.
+
 **`ffmpeg not found`**
 Only needed for non-WAV output. Install it (`sudo apt install ffmpeg`) or write `.wav`.
 

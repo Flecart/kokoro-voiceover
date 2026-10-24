@@ -1,8 +1,8 @@
 # Usage
 
 ```
-tts [TEXT] [-f FILE] [-o OUT] [-v VOICE] [-s SPEED] [-l LANG]
-    [--split {line,paragraph,sentence}] [--pause SEC]
+tts [TEXT] [-f FILE] [-o OUT] [--stream {play,wav,raw}] [-v VOICE] [-s SPEED] [-l LANG]
+    [--split {line,paragraph,sentence}] [--pause SEC] [--sentence-pause SEC]
     [--json FILE] [--srt FILE] [-q] [--list-voices] [--version]
 ```
 
@@ -10,12 +10,14 @@ tts [TEXT] [-f FILE] [-o OUT] [-v VOICE] [-s SPEED] [-l LANG]
 |---|---|---|
 | `TEXT` | | Text to speak. Use `-f` for anything longer than a line. |
 | `-f, --file` | | Read the script from a file; `-f -` reads stdin. |
-| `-o, --out` | `out.wav` | Output file. `.wav` is written directly; `.mp3`, `.m4a`, `.ogg`, `.flac` go through ffmpeg. |
+| `-o, --out` | `out.wav` (none with `--stream`) | Output file. `.wav` is written directly; `.mp3`, `.m4a`, `.ogg`, `.flac` go through ffmpeg. |
+| `--stream` | | Send audio out sentence by sentence as it's generated, without saving a file: `play` to the speakers, `wav` or `raw` to stdout. See [Streaming](#streaming). |
 | `-v, --voice` | `af_heart` | Voice id, or a weighted blend (see below). |
 | `-s, --speed` | `1.0` | Speaking rate. 0.9 is calmer, 1.15 brisker. |
 | `-l, --lang` | from voice | espeak language code. Normally inferred from the voice's first letter. |
 | `--split` | `line` | How the script is cut into segments: one per line, per blank-line-separated paragraph, or per sentence. |
 | `--pause` | `0.35` | Seconds of silence inserted between segments. |
+| `--sentence-pause` | `0.2` | With `--stream`: seconds between sentences inside one segment. |
 | `--json` | | Write segment timings as JSON. |
 | `--srt` | | Write segment timings as SRT captions. |
 | `-q, --quiet` | | No progress output. |
@@ -108,30 +110,57 @@ Each slide stays on screen from the start of its segment until the next segment 
 
 ## Streaming
 
-The `tts` command renders the whole file, which is what a video pipeline wants. For live use (an assistant that should start talking quickly), synthesize sentence by sentence and play each chunk while the next is generated. Kokoro is not autoregressive, so a chunk is the smallest unit: audio arrives a sentence at a time, not word by word.
+`--stream` sends audio out while it is being generated, one sentence at a time, and saves nothing unless you also pass `-o`. The flag takes one value:
 
-Measured on a 2-core cloud VM:
-
-| Approach | First audio after | Keeps up with playback |
+| Value | Where the audio goes | Format |
 |---|---|---|
-| kokoro-onnx's `create_stream` (packs up to the 510-token limit) | 6.6 s | yes |
-| one `create` call per sentence | 1.3 s | yes (~2.4× real time) |
+| `--stream play` | your speakers | played through `paplay`, `aplay` or `ffplay` |
+| `--stream wav` | stdout | WAV stream, 16-bit, 24 kHz, mono |
+| `--stream raw` | stdout | headerless 16-bit little-endian PCM, 24 kHz, mono |
 
-A minimal sentence-level loop, run with the installed environment (`~/.local/share/kokoro-tts/venv/bin/python`):
-
-```python
-import os, re, sys
-sys.path.insert(0, os.path.expanduser("~/.local/share/kokoro-tts"))
-from tts import load_model
-
-k = load_model()
-text = "First sentence. Second sentence. Third one."
-for sentence in re.split(r"(?<=[.!?])\s+", text):
-    audio, sr = k.create(sentence, voice="af_heart", lang="en-us")
-    # hand `audio` (float32, mono, 24 kHz) to your player, e.g. sounddevice.play(audio, sr)
+```bash
+tts --stream play "Speak this right away."
+tts --stream play -f script.txt -v if_sara                     # read a whole script aloud
+tts --stream wav -f script.txt | ffplay -nodisp -autoexit -    # any player that reads WAV from stdin
+tts --stream raw -f script.txt | aplay -q -t raw -f S16_LE -r 24000 -c 1
+tts --stream play -f script.txt -o narration.mp3               # play and save at the same time
 ```
 
-When the text itself comes from an LLM token by token, buffer tokens until a sentence ends, then synthesize that sentence.
+**Text that is still being written.** With `-f -`, `--stream` reads stdin as it arrives and speaks each sentence as soon as it is complete, so it can voice the output of another program (an LLM, a log, a chat) while that program is still writing:
+
+```bash
+some-llm-command "Explain photosynthesis briefly." | tts --stream play -f -
+```
+
+A sentence counts as complete at a newline, or at `.`, `!`, `?` or `…` followed by a space.
+
+**How fast it starts.** Kokoro generates a whole sentence in one pass (it is not autoregressive), so audio arrives a sentence at a time rather than word by word. Measured on a 2-core cloud VM:
+
+| | First audio after | Then |
+|---|---|---|
+| `--stream` (one sentence at a time) | ~2.5 s from launch: ~1 s loading the model, ~1.3 s for the first sentence | generation runs ~2× faster than playback, so there are no gaps |
+| kokoro-onnx's own `create_stream` (packs up to the 510-token limit) | ~6.6 s after the model is loaded | |
+| rendering the whole file first | when everything is done | |
+
+Shorter first sentences start sooner. Streaming splits multi-sentence lines into separate sentences, so intonation across a long line can differ slightly from a file render.
+
+**Which player `play` uses.** `paplay` if a PulseAudio or PipeWire server is running (the default on Ubuntu desktops), otherwise `aplay`, otherwise `ffplay`; the choice is printed to stderr. To use something else, set `TTS_PLAYER` to a command that plays WAV from stdin:
+
+```bash
+TTS_PLAYER="mpv --no-video --really-quiet -" tts --stream play "Hello."
+```
+
+**From Python.** To get the audio as arrays instead (to feed your own player or a network stream), use the installed environment (`~/.local/share/kokoro-tts/venv/bin/python`):
+
+```python
+import os, sys
+sys.path.insert(0, os.path.expanduser("~/.local/share/kokoro-tts"))
+from tts import load_model, split_sentences
+
+k = load_model()
+for sentence in split_sentences("First sentence. Second sentence. Third one."):
+    audio, sr = k.create(sentence, voice="af_heart", lang="en-us")  # float32, mono, 24 kHz
+```
 
 ## Environment variables
 
@@ -141,3 +170,4 @@ When the text itself comes from an LLM token by token, buffer tokens until a sen
 | `KOKORO_TTS_BIN` | install / uninstall | Where the `tts` command goes (default `~/.local/bin`). |
 | `PYTHON` | install | Python interpreter to build the venv from (3.10–3.13). |
 | `KOKORO_TTS_MODEL`, `KOKORO_TTS_VOICES` | `tts` | Use model / voice files from another location. |
+| `TTS_PLAYER` | `tts --stream play` | Command that plays WAV from stdin, used instead of the auto-detected player. |
