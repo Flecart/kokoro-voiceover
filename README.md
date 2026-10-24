@@ -35,7 +35,7 @@ tts -f script.txt -v "af_heart:70,af_bella:30" -s 1.1 -o blend.wav
 tts --list-voices
 ```
 
-Or skip the file and stream the audio as it's generated, sentence by sentence:
+Or skip the file and stream the audio as it's generated, in chunks sized so playback never runs dry:
 
 ```bash
 tts --stream play "Straight to the speakers."                  # play | wav | raw
@@ -43,7 +43,7 @@ tts --stream wav -f script.txt | ffplay -nodisp -autoexit -    # WAV on stdout f
 some-llm-command | tts --stream play -f -                      # speaks while the text is still arriving
 ```
 
-Each line of the script becomes one segment (`--split paragraph` or `--split sentence` to change that), joined by a 0.35 s pause (`--pause`). The JSON looks like:
+Each line of the script becomes one segment, joined by a 0.35 s pause (`--pause`). Pasted prose that is hard-wrapped mid-sentence (from a PDF, LaTeX, email) is detected, rejoined and cut at sentence boundaries instead; `--split line|paragraph|sentence` overrides this. The JSON looks like:
 
 ```json
 { "duration": 12.945, "segments": [

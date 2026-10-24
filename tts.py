@@ -10,17 +10,21 @@ Usage:
   some-llm-command | tts --stream play -f -
   tts --list-voices
 
-Each non-empty line of the input (or paragraph / sentence, see --split) becomes
-one segment. Segments are synthesized separately and joined with a short pause;
-their start/end times go to --json / --srt so cuts and captions line up.
+By default (--split auto) each line of the input is one segment, except that
+hard-wrapped prose (lines broken mid-sentence, as in text copied from a PDF) is
+rejoined and cut at sentence boundaries instead. Segments are synthesized
+separately and joined with a short pause; their start/end times go to --json /
+--srt so cuts and captions line up.
 
-With --stream, audio goes out sentence by sentence as it is generated (to the
-speakers, or to stdout for piping) and no file is written unless -o is given.
+With --stream, audio goes out as it is generated (to the speakers, or to stdout
+for piping), in chunks sized so playback doesn't run dry, and no file is written
+unless -o is given.
 """
-import argparse, codecs, json, os, queue, re, shlex, shutil, struct, subprocess, sys, tempfile, threading
+import argparse, codecs, json, os, queue, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time
+from collections import deque
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 MODEL = Path(os.environ.get("KOKORO_TTS_MODEL", HERE / "models" / "kokoro-v1.0.onnx"))
@@ -38,8 +42,19 @@ PLAYERS = [
     (["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", "-i", "-"], True),
 ]
 
-# End of a sentence: terminal punctuation, optional closing quote/bracket, then whitespace.
+# Chunk sizes, in characters. Kokoro sounds best on inputs of roughly 100-200 tokens:
+# very short ones come out flat, very long ones rush.
+PACK_LIMIT = 220      # pack whole sentences into chunks up to this long
+LONG_LINE = 300       # a script line longer than this is cut into sentence chunks
+LONG_SENTENCE = 300   # a sentence longer than this is cut at clause boundaries
+CLAUSE_PAUSE = 0.08   # silence where a sentence was cut at a comma, colon, etc.
+
+# End of a sentence: terminal punctuation, optional closing quote/bracket.
 SENTENCE_END = r"[.!?…]+[\"'”’)\]]*"
+SENTENCE_BREAK = re.compile(rf"{SENTENCE_END}(?=\s)")
+LINE_DONE = re.compile(rf"(?:{SENTENCE_END}|[:;])\s*$")
+CLAUSE_BREAK = re.compile(r"[,;:]\s+|\s+[—–-]{1,2}\s+|—")
+LIST_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s")
 
 
 def espeak_config():
@@ -88,75 +103,207 @@ def load_model():
     return Kokoro(str(MODEL), str(VOICES), espeak_config=espeak_config())
 
 
+# ---------------------------------------------------------------- text -> units
+#
+# A "unit" is (text, kind): the text to synthesize in one call, and what kind of
+# boundary precedes it, which sets the silence inserted before it:
+#   "segment"  -> --pause           (between script lines and paragraphs)
+#   "sentence" -> --sentence-pause  (between sentences inside a paragraph)
+#   "clause"   -> CLAUSE_PAUSE      (where a long sentence was cut at a comma)
+
 def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def segments_from_text(text, split):
-    text = text.replace("\r\n", "\n").strip()
-    if split == "paragraph":
-        parts = re.split(r"\n\s*\n", text)
-    elif split == "line":
-        parts = text.split("\n")
-    else:  # sentence
-        return split_sentences(text)
-    return [clean(p) for p in parts if p.strip()]
+def continues(a, b):
+    """Does line `a` run on into line `b`, i.e. was the text hard-wrapped mid-sentence?"""
+    a, b = a.rstrip(), b.lstrip()
+    if not a or not b or LINE_DONE.search(a) or LIST_ITEM.match(b):
+        return False
+    if re.search(r"[,(/&\-–—]$", a):
+        return True
+    letter = re.search(r"[^\W\d_]", b)
+    if letter and letter.group().islower():   # next line starts mid-sentence
+        return True
+    return len(a) >= 40 and re.search(r"\w$", a) is not None   # long line cut at a word
+
+
+def join_wrapped(a, b):
+    a, b = a.rstrip(), b.lstrip()
+    if re.search(r"[^\W\d_]-$", a) and b[:1].islower():   # word hyphenated across lines
+        return a + b
+    return f"{a} {b}"
 
 
 def split_sentences(text):
     parts, last = [], 0
-    for m in re.finditer(rf"{SENTENCE_END}\s+", text):
+    for m in SENTENCE_BREAK.finditer(text):
         parts.append(text[last:m.end()])
         last = m.end()
     parts.append(text[last:])
     return [clean(p) for p in parts if p.strip()]
 
 
-def units_from_text(text, split):
-    """(sentence, ends_segment) pairs for streaming a text that is already complete."""
-    for seg in segments_from_text(text, split):
-        sents = split_sentences(seg)
-        for j, s in enumerate(sents):
-            yield s, j == len(sents) - 1
+def clause_cuts(text):
+    return [m.end() for m in CLAUSE_BREAK.finditer(text) if 20 <= m.end() <= len(text) - 15]
+
+
+def split_long(sentence, limit=LONG_SENTENCE):
+    """Cut an overlong sentence at the clause boundary nearest its middle, recursively."""
+    if len(sentence) <= limit:
+        return [sentence]
+    cuts = clause_cuts(sentence)
+    if not cuts:
+        return [sentence]
+    c = min(cuts, key=lambda x: abs(x - len(sentence) / 2))
+    return split_long(clean(sentence[:c]), limit) + split_long(clean(sentence[c:]), limit)
+
+
+def pack(pieces, limit=PACK_LIMIT):
+    chunks = []
+    for p in pieces:
+        if chunks and len(chunks[-1]) + 1 + len(p) <= limit:
+            chunks[-1] += " " + p
+        else:
+            chunks.append(p)
+    return chunks
+
+
+def prose_chunks(text):
+    return pack([piece for s in split_sentences(text) for piece in split_long(s)])
+
+
+def paragraphs(text):
+    text = text.replace("\r\n", "\n")
+    return [[l.strip() for l in p.split("\n") if l.strip()]
+            for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+
+def logical_lines(lines):
+    """Rejoin a paragraph's hard-wrapped lines. Returns (line, is_prose) pairs; a paragraph
+    with no wrapped line is a script, and its lines are kept exactly as written."""
+    if not any(continues(a, b) for a, b in zip(lines, lines[1:])):
+        return [(l, False) for l in lines]
+    out, last = [lines[0]], lines[0]
+    for b in lines[1:]:
+        if continues(last, b) or LINE_DONE.search(last):
+            out[-1] = join_wrapped(out[-1], b)
+        else:                       # e.g. a heading inside the paragraph
+            out.append(b)
+        last = b
+    return [(l, True) for l in out]
+
+
+def plan(text, split):
+    """The whole text as a list of units (see above)."""
+    if split == "line":
+        return [(clean(l), "segment") for l in text.replace("\r\n", "\n").split("\n") if l.strip()]
+    if split == "paragraph":
+        return [(clean(" ".join(p)), "segment") for p in paragraphs(text)]
+    if split == "sentence":
+        return [(s, "segment") for s in split_sentences(text)]
+    units = []  # auto
+    for lines in paragraphs(text):
+        for line, prose in logical_lines(lines):
+            chunks = prose_chunks(line) if prose or len(line) > LONG_LINE else [clean(line)]
+            for i, c in enumerate(chunks):
+                units.append((c, "segment" if i == 0 else "sentence"))
+    return units
+
+
+def sentence_units(units):
+    """Break units into single sentences, which the streaming chunker re-packs."""
+    for text, kind in units:
+        for j, s in enumerate(split_sentences(text)):
+            yield s, kind if j == 0 else "sentence"
 
 
 def units_from_stdin():
-    """(sentence, ends_line) pairs, each yielded as soon as it is complete on stdin,
-    so text produced incrementally (e.g. by an LLM) starts playing before it ends."""
+    """Sentences from stdin, each yielded as soon as it is complete, so text produced
+    incrementally (e.g. by an LLM) starts playing before it ends. Hard-wrapped lines are
+    rejoined, which needs a peek at the first letter of the next line."""
     fd = sys.stdin.fileno()
     dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    boundary = re.compile(rf"\n|{SENTENCE_END}[ \t]+")
-    buf = ""
+    buf, eof, kind = "", False, "segment"
     while True:
-        data = os.read(fd, 65536)
-        buf += dec.decode(data, final=not data)
-        while (m := boundary.search(buf)):
-            piece, buf = buf[:m.end()], buf[m.end():]
-            if piece.strip():
-                yield clean(piece), m.group() == "\n"
-        if not data:
-            break
-    if buf.strip():
-        yield clean(buf), True
+        if not eof:
+            data = os.read(fd, 65536)
+            eof = not data
+            buf += dec.decode(data, final=eof)
+        while True:
+            nl = buf.find("\n")
+            m = SENTENCE_BREAK.search(buf)
+            if m and (nl == -1 or m.end() <= nl):           # a sentence ends on this line
+                piece, buf = buf[:m.end()], buf[m.end():].lstrip(" \t")
+                if piece.strip():
+                    yield clean(piece), kind
+                    kind = "sentence"
+                if buf.startswith("\n"):                    # ...and the line ends with it
+                    buf, kind = buf[1:], "segment"
+                continue
+            if nl == -1:
+                break
+            line, rest = buf[:nl], buf[nl + 1:]
+            if not line.strip():                            # blank line
+                buf, kind = rest, "segment"
+                continue
+            nxt = rest.lstrip(" \t")
+            if not nxt and not eof:
+                break                                       # wait for the next line
+            if nxt and not nxt.startswith("\n") and continues(line, nxt):
+                buf = join_wrapped(line, rest)              # hard wrap: keep reading
+                continue
+            yield clean(line), kind                         # a line that stands alone
+            buf, kind = rest, "segment"
+        if eof:
+            if buf.strip():
+                yield clean(buf), kind
+            return
 
 
-def resolve_voice(k, spec):
-    """'af_heart' or a weighted blend like 'af_heart:70,af_bella:30'."""
-    import numpy as np
-    if ":" not in spec and "," not in spec:
-        return spec, spec
-    parts = [p.split(":") for p in spec.split(",")]
-    names = [p[0].strip() for p in parts]
-    weights = np.array([float(p[1]) if len(p) > 1 else 1.0 for p in parts])
-    weights = weights / weights.sum()
-    return sum(w * k.get_voice_style(n) for w, n in zip(weights, names)), names[0]
+class Chunker:
+    """Decides what to synthesize next while streaming. Each chunk should finish
+    generating before the audio already queued runs out: when there is slack, whole
+    sentences are packed together (better prosody); when there isn't (e.g. right at the
+    start), a long sentence is cut at a comma so the first part is ready in time."""
+
+    def __init__(self, source, can_peek):
+        self.src, self.back, self.can_peek = iter(source), deque(), can_peek
+        self.rate = 0.02  # seconds of compute per character; refined as chunks are made
+
+    def observe(self, chars, seconds):
+        self.rate = 0.5 * self.rate + 0.5 * seconds / max(chars, 1)
+
+    def _take(self):
+        return self.back.popleft() if self.back else next(self.src, None)
+
+    def _peek(self):
+        if not self.back:
+            nxt = next(self.src, None)
+            if nxt is None:
+                return None
+            self.back.append(nxt)
+        return self.back[0]
+
+    def next(self, ahead):
+        unit = self._take()
+        if unit is None:
+            return None
+        text, kind = unit
+        budget = max(0.8 * ahead, 1.0) / self.rate   # characters we can afford right now
+        if self.can_peek:
+            while (nxt := self._peek()) and nxt[1] == "sentence" \
+                    and len(text) + 1 + len(nxt[0]) <= min(PACK_LIMIT, budget):
+                text = f"{text} {self._take()[0]}"
+        if len(text) > budget and (cuts := clause_cuts(text)):
+            fit = [c for c in cuts if c <= budget]
+            c = max(fit) if fit else min(cuts)
+            self.back.appendleft((clean(text[c:]), "clause"))
+            text = clean(text[:c])
+        return text, kind
 
 
-def srt_time(t):
-    ms = int(round(t * 1000))
-    h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
+# ---------------------------------------------------------------- audio output
 
 def wav_stream_header(sr):
     """WAV header for a stream of unknown length (sizes set to the maximum)."""
@@ -165,12 +312,24 @@ def wav_stream_header(sr):
             + b"data" + struct.pack("<I", 0xFFFFFFFF))
 
 
+def pcm16(audio):
+    import numpy as np
+    return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+
 class StreamSink:
     """Sends 16-bit PCM to a player or to stdout from a background thread, so the next
-    sentence is synthesized while the current one plays."""
+    chunk is synthesized while the current one plays. Output starts when release() is
+    called, which lets the caller hold back the first chunk until enough audio is queued.
+    It tracks how much audio is queued ahead of playback, and when playing it feeds
+    silence if synthesis falls behind, so a slow chunk becomes a slightly longer pause
+    instead of a buffer underrun."""
 
     def __init__(self, mode, verbose=True):
         self.proc, self.broken = None, False
+        self.written, self.queued, self.started, self.filled = 0.0, 0.0, None, 0.0
+        self.fill = mode == "play"
+        self.released = threading.Event()
         if mode == "play":
             custom = os.environ.get("TTS_PLAYER")
             if custom:
@@ -200,25 +359,57 @@ class StreamSink:
             self.out, wav = sys.stdout.buffer, mode == "wav"
         self.q = queue.Queue()
         if wav:
-            self.q.put(wav_stream_header(SR))
+            self._send(wav_stream_header(SR))
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def _run(self):
-        while (b := self.q.get()) is not None:
-            if self.broken:
-                continue
-            try:
-                self.out.write(b)
-                self.out.flush()
-            except (BrokenPipeError, OSError):
-                self.broken = True  # player closed or downstream pipe ended
+    def ahead(self):
+        """Seconds of audio queued but (assuming real-time playback) not yet played."""
+        if self.started is None:
+            return self.queued
+        return max(0.0, self.written - (time.monotonic() - self.started))
 
-    def write(self, audio):
-        import numpy as np
-        self.q.put((np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes())
+    def release(self):
+        self.released.set()
+
+    def _send(self, b):
+        if self.broken:
+            return
+        try:
+            self.out.write(b)
+            self.out.flush()
+        except (BrokenPipeError, OSError):
+            self.broken = True  # player closed or downstream pipe ended
+
+    def _run(self):
+        while True:
+            timeout = None
+            if self.fill and self.started is not None:
+                timeout = max(self.ahead() - 0.1, 0.01)   # wake just before playback runs dry
+            try:
+                item = self.q.get(timeout=timeout)
+            except queue.Empty:
+                self._send(b"\0\0" * int(0.1 * SR))       # nothing ready: keep the player fed
+                self.written += 0.1
+                self.filled += 0.1
+                continue
+            if item is None:
+                break
+            gap, pcm = item
+            gap = max(0.0, gap - self.filled)             # silence already played counts
+            self.filled = 0.0
+            if self.started is None:
+                self.released.wait()
+                self.started = time.monotonic()
+            self._send(b"\0\0" * int(gap * SR) + pcm)
+            self.written += gap + len(pcm) / 2 / SR
+
+    def write(self, audio, gap):
+        self.queued += gap + len(audio) / SR
+        self.q.put((gap, pcm16(audio)))
 
     def close(self):
+        self.release()
         self.q.put(None)
         self.thread.join()
         if self.proc:
@@ -254,6 +445,26 @@ def save_audio(path, audio, sr):
         tmp.unlink(missing_ok=True)
 
 
+def resolve_voice(k, spec):
+    """'af_heart' or a weighted blend like 'af_heart:70,af_bella:30'."""
+    import numpy as np
+    if ":" not in spec and "," not in spec:
+        return spec, spec
+    parts = [p.split(":") for p in spec.split(",")]
+    names = [p[0].strip() for p in parts]
+    weights = np.array([float(p[1]) if len(p) > 1 else 1.0 for p in parts])
+    weights = weights / weights.sum()
+    return sum(w * k.get_voice_style(n) for w, n in zip(weights, names)), names[0]
+
+
+def srt_time(t):
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+# ---------------------------------------------------------------- main
+
 def main():
     ap = argparse.ArgumentParser(prog="tts", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -263,18 +474,20 @@ def main():
                     help="output file (default: out.wav, or none with --stream); .wav is written directly, "
                          "other extensions (.mp3, .m4a, .ogg, .flac) via ffmpeg")
     ap.add_argument("--stream", choices=["play", "wav", "raw"],
-                    help="send audio out sentence by sentence as it is generated, without saving a file: "
+                    help="send audio out as it is generated, without saving a file: "
                          "'play' = to the speakers, 'wav' = WAV stream on stdout, "
                          "'raw' = raw 16-bit 24 kHz mono PCM on stdout")
     ap.add_argument("-v", "--voice", default="af_heart",
                     help="voice id, or a weighted blend like 'af_heart:70,af_bella:30' (default: af_heart)")
     ap.add_argument("-s", "--speed", type=float, default=1.0, help="speaking rate, e.g. 0.9 or 1.15 (default: 1.0)")
     ap.add_argument("-l", "--lang", help="espeak language code (default: inferred from the voice prefix)")
-    ap.add_argument("--split", choices=["line", "paragraph", "sentence"], default="line",
-                    help="how to cut the input into segments (default: line)")
-    ap.add_argument("--pause", type=float, default=0.35, help="seconds of silence between segments (default: 0.35)")
+    ap.add_argument("--split", choices=["auto", "line", "paragraph", "sentence"], default="auto",
+                    help="how to cut the input into segments: auto = one per line, but hard-wrapped prose is "
+                         "rejoined and cut at sentences; line = every line exactly as written (default: auto)")
+    ap.add_argument("--pause", type=float, default=0.35,
+                    help="seconds of silence between lines / paragraphs (default: 0.35)")
     ap.add_argument("--sentence-pause", type=float, default=0.2,
-                    help="with --stream, seconds of silence between sentences of the same segment (default: 0.2)")
+                    help="seconds of silence between chunks of the same paragraph (default: 0.2)")
     ap.add_argument("--json", help="write segment timings as JSON")
     ap.add_argument("--srt", help="write segment timings as SRT captions")
     ap.add_argument("-q", "--quiet", action="store_true", help="no progress output")
@@ -286,11 +499,8 @@ def main():
         print("\n".join(sorted(load_model().get_voices())))
         return
 
-    # Input, as (text unit, ends a segment) pairs. Streaming from stdin stays lazy.
-    lazy = a.stream and a.file == "-"
-    if lazy:
-        units = units_from_stdin()
-    else:
+    lazy = a.stream and a.file == "-"   # stream stdin as it arrives
+    if not lazy:
         if a.file:
             try:
                 text = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
@@ -300,8 +510,7 @@ def main():
             text = a.text
         else:
             ap.error("give TEXT or -f FILE")
-        units = (list(units_from_text(text, a.split)) if a.stream
-                 else [(s, True) for s in segments_from_text(text, a.split)])
+        units = plan(text, a.split)
         if not units:
             ap.error("input text is empty")
     out_path = a.out or (None if a.stream else "out.wav")
@@ -315,34 +524,45 @@ def main():
         ap.error(f"unknown voice: {', '.join(unknown)} (see: tts --list-voices)")
     voice, first = resolve_voice(k, a.voice)
     lang = a.lang or LANG_BY_PREFIX.get(first[0], "en-us")
+    pauses = {"segment": a.pause, "sentence": a.sentence_pause, "clause": CLAUSE_PAUSE}
 
     sink = StreamSink(a.stream, verbose=not a.quiet) if a.stream else None
-    chunks, timeline, t, prev_ends = [], [], 0.0, None
-    total = None if lazy else len(units)
+    if sink:
+        chunker = Chunker(units_from_stdin() if lazy else sentence_units(units), can_peek=not lazy)
+        next_unit = lambda: chunker.next(sink.ahead())
+    else:
+        it = iter(units)
+        next_unit = lambda: next(it, None)
+
+    chunks, timeline, t = [], [], 0.0
     try:
-        for i, (s, ends) in enumerate(units):
+        while (unit := next_unit()) is not None:
+            s, kind = unit
+            # Start playing once the queued audio, plus the pause before this chunk (which
+            # absorbs a short stall) and a quarter second, covers the time to generate it.
+            if sink and not sink.released.is_set() and timeline and \
+                    sink.queued + pauses[kind] + 0.25 >= len(s) * chunker.rate:
+                sink.release()
+            t0 = time.monotonic()
             audio, sr = k.create(s, voice=voice, speed=a.speed, lang=lang)
-            audio = audio.astype(np.float32)
-            if prev_ends is not None:  # silence before every unit but the first
-                gap = np.zeros(int((a.pause if prev_ends else a.sentence_pause) * SR), dtype=np.float32)
-                t += len(gap) / SR
-                audio_out = np.concatenate([gap, audio])
-                if out_path:
-                    chunks.append(gap)
-            else:
-                audio_out = audio
-            dur = len(audio) / sr
-            timeline.append({"index": i, "text": s, "start": round(t, 3), "end": round(t + dur, 3)})
-            t += dur
-            prev_ends = ends
-            if out_path:
-                chunks.append(audio)
             if sink:
-                sink.write(audio_out)
+                chunker.observe(len(s), time.monotonic() - t0)
+            audio = audio.astype(np.float32)
+            gap = pauses[kind] if timeline else 0.0
+            t += gap
+            dur = len(audio) / sr
+            timeline.append({"index": len(timeline), "text": s, "start": round(t, 3), "end": round(t + dur, 3)})
+            t += dur
+            if out_path:
+                chunks += [np.zeros(int(gap * SR), dtype=np.float32), audio]
+            if sink:
+                sink.write(audio, gap)
+                if lazy:
+                    sink.release()  # more text may be slow to arrive: start right away
                 if sink.broken:
                     break
             if not a.quiet:
-                n = f"{i + 1}/{total}" if total else f"{i + 1}"
+                n = f"{len(timeline)}" if sink else f"{len(timeline)}/{len(units)}"
                 print(f"[{n}] {dur:5.2f}s  {s[:70]}", file=sys.stderr)
     except KeyboardInterrupt:
         if sink:
@@ -354,13 +574,13 @@ def main():
         ap.error("input text is empty")
 
     if out_path:
-        full = np.concatenate(chunks)
-        save_audio(out_path, full, SR)
+        save_audio(out_path, np.concatenate(chunks), SR)
     if a.json:
         Path(a.json).write_text(json.dumps({
             "audio": out_path, "sample_rate": SR, "duration": round(t, 3),
             "voice": a.voice, "lang": lang, "speed": a.speed, "pause": a.pause,
-            "segments": timeline}, indent=2, ensure_ascii=False), encoding="utf-8")
+            "sentence_pause": a.sentence_pause, "segments": timeline},
+            indent=2, ensure_ascii=False), encoding="utf-8")
     if a.srt:
         Path(a.srt).write_text("\n".join(
             f"{x['index'] + 1}\n{srt_time(x['start'])} --> {srt_time(x['end'])}\n{x['text']}\n"

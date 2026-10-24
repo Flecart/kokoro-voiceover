@@ -15,6 +15,12 @@ The model download was interrupted or altered. Re-run the installer; it retries 
 **`--stream play`: `no audio player found` or `audio player … exited with code 1`**
 `play` needs `paplay` (package `pulseaudio-utils`), `aplay` (`alsa-utils`) or `ffplay` (`ffmpeg`), and a working sound device. Ubuntu desktops have `paplay` already. Check the device with `speaker-test -t sine -l 1`. To use another player, set `TTS_PLAYER` to a command that reads WAV from stdin, or pipe: `tts --stream wav … | your-player`.
 
+**Speech is cut in the middle of a sentence**
+Usually the input is hard-wrapped and `--split line` is set, which reads every line exactly as written; drop it to use the default `auto`, which rejoins wrapped lines. If `auto` misjudges your text (it decides per paragraph, from line endings and the case of the next line), `--split sentence` ignores line breaks entirely and cuts only at sentence ends.
+
+**`underrun!!!` or audible gaps while streaming**
+Fixed in 0.3.0: `--stream` now sizes chunks to keep the player fed and fills any remaining shortfall with silence. Update with the install one-liner. If you still hear gaps, the CPU is generating slower than real time; render a file instead.
+
 **`--stream wav writes binary audio to stdout`**
 `wav` and `raw` print audio data, so `tts` refuses to dump it into a terminal. Pipe it into a player or another program, or use `--stream play`.
 

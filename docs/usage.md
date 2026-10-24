@@ -2,7 +2,7 @@
 
 ```
 tts [TEXT] [-f FILE] [-o OUT] [--stream {play,wav,raw}] [-v VOICE] [-s SPEED] [-l LANG]
-    [--split {line,paragraph,sentence}] [--pause SEC] [--sentence-pause SEC]
+    [--split {auto,line,paragraph,sentence}] [--pause SEC] [--sentence-pause SEC]
     [--json FILE] [--srt FILE] [-q] [--list-voices] [--version]
 ```
 
@@ -11,13 +11,13 @@ tts [TEXT] [-f FILE] [-o OUT] [--stream {play,wav,raw}] [-v VOICE] [-s SPEED] [-
 | `TEXT` | | Text to speak. Use `-f` for anything longer than a line. |
 | `-f, --file` | | Read the script from a file; `-f -` reads stdin. |
 | `-o, --out` | `out.wav` (none with `--stream`) | Output file. `.wav` is written directly; `.mp3`, `.m4a`, `.ogg`, `.flac` go through ffmpeg. |
-| `--stream` | | Send audio out sentence by sentence as it's generated, without saving a file: `play` to the speakers, `wav` or `raw` to stdout. See [Streaming](#streaming). |
+| `--stream` | | Send audio out as it's generated, without saving a file: `play` to the speakers, `wav` or `raw` to stdout. See [Streaming](#streaming). |
 | `-v, --voice` | `af_heart` | Voice id, or a weighted blend (see below). |
 | `-s, --speed` | `1.0` | Speaking rate. 0.9 is calmer, 1.15 brisker. |
 | `-l, --lang` | from voice | espeak language code. Normally inferred from the voice's first letter. |
-| `--split` | `line` | How the script is cut into segments: one per line, per blank-line-separated paragraph, or per sentence. |
-| `--pause` | `0.35` | Seconds of silence inserted between segments. |
-| `--sentence-pause` | `0.2` | With `--stream`: seconds between sentences inside one segment. |
+| `--split` | `auto` | How the text is cut into segments. `auto`: one per line, but hard-wrapped prose is rejoined and cut at sentences (see below). `line`: every line exactly as written. `paragraph`: one per blank-line-separated paragraph. `sentence`: one per sentence. |
+| `--pause` | `0.35` | Seconds of silence between lines and paragraphs. |
+| `--sentence-pause` | `0.2` | Seconds of silence between chunks of the same paragraph. |
 | `--json` | | Write segment timings as JSON. |
 | `--srt` | | Write segment timings as SRT captions. |
 | `-q, --quiet` | | No progress output. |
@@ -26,6 +26,8 @@ tts [TEXT] [-f FILE] [-o OUT] [--stream {play,wav,raw}] [-v VOICE] [-s SPEED] [-
 ## Writing the script
 
 One line per segment works best: a segment is one caption, one timing entry, and the natural place for a cut.
+
+**Pasted prose is fine too.** Text copied from a PDF, a LaTeX source or an email is often hard-wrapped: broken into fixed-width lines mid-sentence. In the default `auto` mode, `tts` spots this and rejoins the lines, then cuts the paragraph at sentence boundaries into chunks of one or two sentences (up to ~220 characters, the size Kokoro reads most naturally). A line counts as wrapped when it doesn't end in `.`, `!`, `?`, `:` or `;` and either the next line starts with a lowercase letter or the line itself is long (40+ characters). Paragraphs without wrapped lines are left exactly as written, so a one-sentence-per-line script behaves as you'd expect; headings and bulleted items stay on their own. Use `--split line` to turn this off.
 
 - **Keep segments between roughly one clause and three sentences.** Very short inputs (a few words) can come out flat or clipped, and inputs over about 400 tokens tend to rush. If you need a one-word line, consider merging it with its neighbour.
 - **Write things the way they should be said.** "2026" reads fine, but "v2.5", "e.g.", unit symbols and unusual acronyms may not. Spell them out: "version two point five", "for example", "A P I".
@@ -58,6 +60,7 @@ The language of a blend comes from the first voice; override it with `-l` if nee
   "lang": "en-us",
   "speed": 1.0,
   "pause": 0.35,
+  "sentence_pause": 0.2,
   "segments": [
     { "index": 0, "text": "This is a test of the local voice pipeline.", "start": 0.0, "end": 2.56 },
     { "index": 1, "text": "It runs fully offline on the CPU, with no API key and no usage limits.", "start": 2.91, "end": 8.158 }
@@ -65,7 +68,7 @@ The language of a blend comes from the first voice; override it with `-l` if nee
 }
 ```
 
-Times are in seconds from the start of the audio file. `end` is when the speech stops; the pause follows it, so the next segment's `start` is `end + pause`.
+Times are in seconds from the start of the audio file. `end` is when the speech stops; a pause follows it (`pause` between lines and paragraphs, `sentence_pause` between chunks of one paragraph) before the next segment's `start`.
 
 `--srt narration.srt` writes the same segments as standard captions.
 
@@ -110,7 +113,7 @@ Each slide stays on screen from the start of its segment until the next segment 
 
 ## Streaming
 
-`--stream` sends audio out while it is being generated, one sentence at a time, and saves nothing unless you also pass `-o`. The flag takes one value:
+`--stream` sends audio out while it is being generated, a chunk at a time, and saves nothing unless you also pass `-o`. The flag takes one value:
 
 | Value | Where the audio goes | Format |
 |---|---|---|
@@ -132,17 +135,24 @@ tts --stream play -f script.txt -o narration.mp3               # play and save a
 some-llm-command "Explain photosynthesis briefly." | tts --stream play -f -
 ```
 
-A sentence counts as complete at a newline, or at `.`, `!`, `?` or `…` followed by a space.
+A sentence counts as complete at `.`, `!`, `?` or `…` followed by a space, or at the end of a line that isn't hard-wrapped (to tell, `tts` waits for the first letter of the next line).
 
-**How fast it starts.** Kokoro generates a whole sentence in one pass (it is not autoregressive), so audio arrives a sentence at a time rather than word by word. Measured on a 2-core cloud VM:
+**How the chunks are chosen.** Kokoro generates a whole chunk in one pass (it is not autoregressive), so audio arrives a chunk at a time rather than word by word, and each chunk has to finish generating before the audio already queued runs out. `tts` measures how fast your machine generates and sizes every chunk to fit:
 
-| | First audio after | Then |
+- When there is slack, it packs whole sentences together (up to ~220 characters), which sounds closer to a file render.
+- When there isn't, typically right at the start, it cuts a long sentence at a comma, colon or dash, so the first part is ready in time. It never cuts mid-phrase.
+- Playback starts with the first chunk unless the next one clearly won't be ready in time, in which case it waits for it. On a typical CPU this costs nothing; on a very slow one it trades a later start for no stall.
+- If generation still falls behind, `play` feeds silence to the player, so a late chunk becomes a slightly longer pause at a sentence or clause boundary rather than a buffer underrun.
+
+**How fast it starts.** Measured with a 63-second hard-wrapped text and a player that consumes audio in real time:
+
+| CPU | First audio after launch | Gaps during playback |
 |---|---|---|
-| `--stream` (one sentence at a time) | ~2.5 s from launch: ~1 s loading the model, ~1.3 s for the first sentence | generation runs ~2× faster than playback, so there are no gaps |
-| kokoro-onnx's own `create_stream` (packs up to the 510-token limit) | ~6.6 s after the model is loaded | |
-| rendering the whole file first | when everything is done | |
+| 2 cores | ~2 s (≈1 s of it loading the model) | none (≤0.3 s of extra pause in total) |
+| 1 core | ~2 s | none (≤0.3 s of extra pause in total) |
+| 1 core shared with a busy process (≈ half speed) | ~6.5 s (holds until it can keep up) | none |
 
-Shorter first sentences start sooner. Streaming splits multi-sentence lines into separate sentences, so intonation across a long line can differ slightly from a file render.
+For comparison, kokoro-onnx's own `create_stream` packs text up to the model's 510-token limit and took ~6.6 s after loading to produce its first audio on 2 cores.
 
 **Which player `play` uses.** `paplay` if a PulseAudio or PipeWire server is running (the default on Ubuntu desktops), otherwise `aplay`, otherwise `ffplay`; the choice is printed to stderr. To use something else, set `TTS_PLAYER` to a command that plays WAV from stdin:
 
