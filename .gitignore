@@ -1,0 +1,11 @@
+models/
+venv/
+.venv/
+__pycache__/
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+*.srt
+narration.json
